@@ -30,7 +30,7 @@ force_fft = -44
 calibrate_seconds = 90
 
 [mqtt]
-mqtt_host     = "192.168.68.10"
+mqtt_host     = "YOUR_BROKER_HOST"
 mqtt_port     = 1883
 mqtt_username = ""
 mqtt_password = ""
