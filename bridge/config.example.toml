@@ -8,9 +8,15 @@ baud = 115200
 # Reapplied after every board reset; console_test keeps none of this in NVS.
 wifi_ssid     = "YOUR_SSID"
 wifi_password = "CHANGE_ME"
-# Pin the BSSID. On a mesh the STA will otherwise roam between nodes and the
-# CSI reference path changes underneath the calibration.
-wifi_bssid    = "aa:bb:cc:dd:ee:ff"   # from: wifi_scan -s YOUR_SSID
+# REQUIRED, and it must be a real BSSID from YOUR network -- the value below
+# is a placeholder and the bridge will refuse to start until you change it.
+# A wrong BSSID fails silently: the board simply never associates, so there is
+# no CSI and calibration collects nothing.
+# Get it from the board's console:
+#     wifi_scan -s YOUR_SSID
+# Pin it because on a mesh the STA otherwise roams between nodes and the CSI
+# reference path changes underneath the calibration.
+wifi_bssid    = "aa:bb:cc:dd:ee:ff"
 
 [gain]
 # Pin the receiver gain. Without this, AGC swings CSI amplitude ~2x on its own

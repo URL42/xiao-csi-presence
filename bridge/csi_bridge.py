@@ -104,7 +104,35 @@ class Config:
         known = {f for f in cls.__dataclass_fields__ if f != "extra"}
         cfg = cls(**{k: v for k, v in flat.items() if k in known})
         cfg.extra = {k: v for k, v in flat.items() if k not in known}
+        cfg.validate()
         return cfg
+
+    # Values carried over unedited from config.example.toml. Catching these is
+    # worth a dedicated check: a placeholder BSSID looks entirely plausible in a
+    # log line, and the board fails silently by simply never associating.
+    PLACEHOLDERS = {
+        "wifi_ssid": {"YOUR_SSID"},
+        "wifi_password": {"CHANGE_ME"},
+        "wifi_bssid": {"aa:bb:cc:dd:ee:ff", "xx:xx:xx:xx:xx:xx"},
+        "mqtt_host": {"YOUR_BROKER_HOST"},
+    }
+
+    def validate(self) -> None:
+        bad = [f"{field} = {getattr(self, field)!r}"
+               for field, dummies in self.PLACEHOLDERS.items()
+               if getattr(self, field) in dummies]
+        if bad:
+            raise SystemExit(
+                "config.toml still contains placeholder values from the "
+                "example file:\n  " + "\n  ".join(bad) +
+                "\n\nGet the real BSSID from the board's console:\n"
+                "    wifi_scan -s <your ssid>\n"
+                "and the gain baseline from:\n"
+                "    csi_gain --status"
+            )
+        if self.wifi_bssid and not re.fullmatch(
+                r"([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}", self.wifi_bssid):
+            raise SystemExit(f"wifi_bssid {self.wifi_bssid!r} is not a MAC address")
 
 
 def find_port(configured: str) -> str:
@@ -154,12 +182,41 @@ class Board:
                 return
         LOG.warning("boot did not settle within %.0fs, continuing anyway", limit)
 
-    def send(self, cmd: str, settle: float = 1.0) -> None:
+    def send(self, cmd: str, settle: float = 1.0) -> list[str]:
         LOG.info("-> %s", cmd if "password" not in cmd and " -p " not in cmd
                  else re.sub(r"(-p|--password)\s+\S+", r"\1 <redacted>", cmd))
         self.ser.write(cmd.encode() + b"\r\n")
         self.ser.flush()
-        time.sleep(settle)
+        # drain while we wait, so the reply is available and the OS buffer
+        # does not overflow under a heavy CSI stream
+        out: list[str] = []
+        t0 = time.time()
+        while time.time() - t0 < settle:
+            out.extend(self.lines())
+            time.sleep(0.02)
+        return out
+
+    def wait_for(self, pattern: str, timeout: float, what: str) -> str | None:
+        """Watch the stream for a pattern, returning the matching line."""
+        rx = re.compile(pattern)
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            for line in self.lines():
+                if rx.search(line):
+                    return line
+            time.sleep(0.05)
+        LOG.error("timed out after %.0fs waiting for %s", timeout, what)
+        return None
+
+    def count_samples(self, seconds: float) -> int:
+        n = 0
+        t0 = time.time()
+        while time.time() - t0 < seconds:
+            for line in self.lines():
+                if parse_sample(line) is not None:
+                    n += 1
+            time.sleep(0.02)
+        return n
 
     def lines(self):
         """Yield complete decoded lines as they arrive."""
@@ -172,13 +229,25 @@ class Board:
 
     # ---- setup that must be reapplied after every reset ----
 
-    def apply_setup(self) -> None:
+    def apply_setup(self) -> bool:
+        """Reapply the volatile config. Returns True if the board associated."""
         c = self.cfg
+        connected = True
         if c.wifi_ssid:
             cmd = f"wifi_config -s {c.wifi_ssid} -p {c.wifi_password}"
             if c.wifi_bssid:
                 cmd += f" -b {c.wifi_bssid}"
-            self.send(cmd, settle=12.0)
+            self.send(cmd, settle=1.0)
+            line = self.wait_for(r"connected with|sta ip:", 20.0,
+                                 "the board to associate")
+            if line is None:
+                LOG.error("not associated. Check ssid/password, and that "
+                          "wifi_bssid is a real BSSID from `wifi_scan -s %s`",
+                          c.wifi_ssid)
+                connected = False
+            else:
+                LOG.info("associated: %s", line.split(":", 1)[-1].strip()[:90])
+                self.wait_for(r"sta ip:", 15.0, "a DHCP lease")
 
         if c.force_agc is not None and c.force_fft is not None:
             # let the gain baseline settle before pinning it
@@ -190,6 +259,26 @@ class Board:
             self.send(f"radar --predict_someone_threshold={c.someone_threshold}")
         if c.move_threshold is not None:
             self.send(f"radar --predict_move_threshold={c.move_threshold}")
+
+        return connected
+
+    def preflight(self) -> bool:
+        """Confirm CSI is actually flowing before committing to a long capture.
+
+        Calibration takes 90s with the operator stood outside the room. Finding
+        out afterwards that nothing was ever received is the worst possible
+        outcome, so spend three seconds proving the stream first.
+        """
+        LOG.info("preflight: checking CSI is flowing")
+        n = self.count_samples(3.0)
+        rate = n / 3.0
+        if n == 0:
+            LOG.error("preflight FAILED: no CSI samples in 3s. The board is "
+                      "not associated, or the radar is stopped "
+                      "(`radar --csi_start`).")
+            return False
+        LOG.info("preflight OK: %.1f samples/s", rate)
+        return True
 
     def calibrate(self) -> tuple[float, float] | None:
         """Run training. The room MUST be empty."""
@@ -216,7 +305,9 @@ class Board:
                         return None
                     return wth, jth
             time.sleep(0.05)
-        LOG.error("no calibration result seen")
+        LOG.error("no calibration result seen. esp_radar only emits a result "
+                  "when it has a CSI peer, so this almost always means no CSI "
+                  "arrived during the capture.")
         return None
 
 
@@ -345,9 +436,18 @@ def parse_sample(line: str) -> Sample | None:
 
 def run(cfg: Config, do_calibrate: bool) -> int:
     board = Board(cfg)
-    board.apply_setup()
+    associated = board.apply_setup()
 
     if do_calibrate:
+        # Fail in seconds rather than after a 90s capture with the operator
+        # stood outside the room.
+        if not associated:
+            LOG.error("refusing to calibrate: the board is not on the network")
+            return 1
+        if not board.preflight():
+            LOG.error("refusing to calibrate: no CSI stream")
+            return 1
+
         result = board.calibrate()
         if result is None:
             LOG.error("calibration failed, not publishing")
