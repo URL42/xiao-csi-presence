@@ -520,11 +520,21 @@ def run(cfg: Config, do_calibrate: bool) -> int:
         if result is None:
             LOG.error("calibration failed, not publishing")
             return 1
-        # esp-radar's trained thresholds are a starting point; config overrides win
-        if cfg.someone_threshold is None:
-            board.send(f"radar --predict_someone_threshold={result[0]}")
-        if cfg.move_threshold is None:
-            board.send(f"radar --predict_move_threshold={result[1]}")
+
+        # esp_radar_train_stop() writes its results straight into the
+        # firmware's threshold variables, clobbering whatever apply_setup()
+        # configured. So the overrides must be re-sent here or they are
+        # silently discarded by the act of calibrating.
+        someone = cfg.someone_threshold if cfg.someone_threshold is not None else result[0]
+        move = cfg.move_threshold if cfg.move_threshold is not None else result[1]
+        for name, value, trained, src in (
+                ("someone", someone, result[0], cfg.someone_threshold),
+                ("move", move, result[1], cfg.move_threshold)):
+            if src is not None and src != trained:
+                LOG.info("%s threshold: using configured %g (calibration said %g)",
+                         name, value, trained)
+        board.send(f"radar --predict_someone_threshold={someone}")
+        board.send(f"radar --predict_move_threshold={move}")
 
     pub = Publisher(cfg)
 
