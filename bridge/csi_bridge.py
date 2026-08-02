@@ -207,9 +207,19 @@ class Board:
             time.sleep(0.02)
         return out
 
-    def wait_for(self, pattern: str, timeout: float, what: str) -> str | None:
-        """Watch the stream for a pattern, returning the matching line."""
+    def wait_for(self, pattern: str, timeout: float, what: str,
+                 already: list[str] | None = None) -> str | None:
+        """Watch the stream for a pattern, returning the matching line.
+
+        `already` is any output a preceding send() consumed while settling.
+        Without it the caller races its own drain: the reply frequently lands
+        inside the settle window, gets swallowed there, and the subsequent
+        poll waits for a line that has already gone by.
+        """
         rx = re.compile(pattern)
+        for line in (already or []):
+            if rx.search(line):
+                return line
         t0 = time.time()
         while time.time() - t0 < timeout:
             for line in self.lines():
@@ -248,9 +258,9 @@ class Board:
             cmd = f"wifi_config -s {c.wifi_ssid} -p {c.wifi_password}"
             if c.wifi_bssid:
                 cmd += f" -b {c.wifi_bssid}"
-            self.send(cmd, settle=1.0)
+            settled = self.send(cmd, settle=1.0)
             line = self.wait_for(r"connected with|sta ip:", 20.0,
-                                 "the board to associate")
+                                 "the board to associate", already=settled)
             if line is None:
                 LOG.error("not associated. Check ssid/password, and that "
                           "wifi_bssid is a real BSSID from `wifi_scan -s %s`",
@@ -258,7 +268,10 @@ class Board:
                 connected = False
             else:
                 LOG.info("associated: %s", line.split(":", 1)[-1].strip()[:90])
-                self.wait_for(r"sta ip:", 15.0, "a DHCP lease")
+                # If the matched line was already the DHCP lease we are done;
+                # waiting for a second one just times out spuriously.
+                if "sta ip:" not in line:
+                    self.wait_for(r"sta ip:", 15.0, "a DHCP lease")
 
         if c.force_agc is not None and c.force_fft is not None:
             # let the gain baseline settle before pinning it
@@ -301,24 +314,32 @@ class Board:
             for _ in self.lines():
                 pass
             time.sleep(0.05)
-        self.send("radar --train_stop", settle=3.0)
+        # esp_radar prints the result within milliseconds of the command, so
+        # it almost always lands inside send()'s settle window. Search what
+        # send() consumed before falling back to polling.
+        pending = self.send("radar --train_stop", settle=3.0)
 
         deadline = time.time() + 5
-        while time.time() < deadline:
-            for line in self.lines():
+        while True:
+            for line in pending:
                 m = TRAIN_RE.search(line)
                 if m:
                     n, wth, jth = int(m.group(1)), float(m.group(2)), float(m.group(3))
                     LOG.info("calibration done: data_num=%d wander_th=%g jitter_th=%g",
                              n, wth, jth)
                     if n == 0:
-                        LOG.error("calibration collected 0 samples - is CSI flowing?")
+                        LOG.error("calibration collected 0 samples despite CSI "
+                                  "flowing - esp_radar saw no usable peer.")
                         return None
                     return wth, jth
+            if time.time() > deadline:
+                break
+            pending = self.lines()
             time.sleep(0.05)
-        LOG.error("no calibration result seen. esp_radar only emits a result "
-                  "when it has a CSI peer, so this almost always means no CSI "
-                  "arrived during the capture.")
+
+        LOG.error("train_stop produced no result line. Preflight confirmed CSI "
+                  "was flowing, so check that the board did not reset mid-capture "
+                  "(look for a boot banner above) and that the association held.")
         return None
 
 
