@@ -176,22 +176,58 @@ class Board:
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.ser = serial.Serial(find_port(cfg.port), cfg.baud, timeout=0.1)
-        time.sleep(0.3)
-        self.ser.setDTR(False)     # never fall into the ROM bootloader
+        # Configure the control lines BEFORE opening. serial.Serial(port=...)
+        # opens immediately and macOS asserts both DTR and RTS as it does, which
+        # on an ESP32-S3 are GPIO0 and EN -- i.e. the download-mode entry
+        # gesture. Clearing DTR after the fact is too late: the pulse has
+        # already happened, and it can leave the chip wedged, enumerated on USB
+        # but deaf to both the console and the ROM loader. Assigning .dtr/.rts
+        # on an unopened port records the state so it is applied at open.
+        self.ser = serial.Serial()
+        self.ser.port = find_port(cfg.port)
+        self.ser.baudrate = cfg.baud
+        self.ser.timeout = 0.1
+        self.ser.dtr = False
+        self.ser.rts = False
+        self.ser.open()
         self._buf = b""
         self._wait_boot()
 
     def _wait_boot(self, quiet: float = 1.5, limit: float = 25.0) -> None:
-        LOG.info("waiting for board to finish booting")
+        """Drain any boot output, then prove the console actually answers.
+
+        Silence alone is not readiness -- a hung board is silent too, and
+        treating that as "ready" sends the caller on to a 90s capture that
+        cannot possibly work. Ask for a prompt and insist on getting one.
+        """
+        LOG.info("waiting for board to settle")
         last = t0 = time.time()
         while time.time() - t0 < limit:
             if self.ser.read(4096):
                 last = time.time()
             elif time.time() - last > quiet:
-                LOG.info("board ready")
-                return
-        LOG.warning("boot did not settle within %.0fs, continuing anyway", limit)
+                break
+
+        for attempt in range(3):
+            self.ser.reset_input_buffer()
+            self.ser.write(b"\r\n")
+            self.ser.flush()
+            deadline = time.time() + 2.5
+            seen = ""
+            while time.time() < deadline:
+                seen += self.ser.read(256).decode("utf-8", "replace")
+                if "csi>" in seen:
+                    LOG.info("board ready (console responding)")
+                    return
+                time.sleep(0.05)
+            LOG.warning("no console prompt (attempt %d/3)", attempt + 1)
+
+        raise SystemExit(
+            "The board is enumerated but its console is not responding.\n"
+            "This is usually a wedged chip rather than bad firmware -- it stays\n"
+            "visible on USB while answering neither the console nor the ROM\n"
+            "loader. Unplug the USB cable, plug it back in, and retry."
+        )
 
     def send(self, cmd: str, settle: float = 1.0) -> list[str]:
         LOG.info("-> %s", cmd if "password" not in cmd and " -p " not in cmd
