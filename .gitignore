@@ -1,0 +1,9 @@
+config.toml
+.venv/
+__pycache__/
+*.pyc
+csi*.log
+csi.cmd
+build/
+sdkconfig
+sdkconfig.old

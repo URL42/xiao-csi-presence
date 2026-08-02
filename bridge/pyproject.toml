@@ -1,0 +1,9 @@
+[project]
+name = "csi-mqtt-bridge"
+version = "0.1.0"
+description = "esp-csi serial -> MQTT bridge with Home Assistant discovery"
+requires-python = ">=3.11"
+dependencies = [
+    "pyserial>=3.5",
+    "paho-mqtt>=2.0",
+]

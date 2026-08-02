@@ -1,0 +1,29 @@
+#
+# Seeed Studio XIAO ESP32S3 (ESP32-S3R8) overrides
+#
+# ESP-IDF automatically applies sdkconfig.defaults first, then
+# sdkconfig.defaults.<target>. Keeping board changes here means the
+# upstream sdkconfig.defaults stays pristine and every deviation from
+# stock is visible in one short file.
+#
+
+#
+# Console: the XIAO ESP32S3 has NO UART bridge chip. Its only USB
+# connection is the ESP32-S3's built-in USB Serial/JTAG peripheral
+# (VID 0x303A / PID 0x1001). Upstream defaults put the console on UART0
+# (GPIO43/44), which is not routed to the USB connector on this board --
+# flashing stock gives a completely silent terminal.
+#
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+#
+# Flash: XIAO ESP32S3 ships 8MB. Upstream declares 4MB.
+#
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+
+#
+# CSI. Upstream uses the pre-5.0 symbol name CONFIG_ESP32_WIFI_CSI_ENABLED,
+# which IDF 5.x still honours via sdkconfig.rename. Set the current name
+# explicitly so the value is not dependent on the rename table.
+#
+CONFIG_ESP_WIFI_CSI_ENABLED=y

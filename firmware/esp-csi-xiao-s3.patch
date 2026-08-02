@@ -1,0 +1,298 @@
+diff --git a/examples/esp-radar/console_test/components/commands/src/wifi_cmd.c b/examples/esp-radar/console_test/components/commands/src/wifi_cmd.c
+index effd710..d317929 100644
+--- a/examples/esp-radar/console_test/components/commands/src/wifi_cmd.c
++++ b/examples/esp-radar/console_test/components/commands/src/wifi_cmd.c
+@@ -325,6 +325,14 @@ static int wifi_config_func(int argc, char **argv)
+             ESP_LOGE(TAG, "The format of the address is incorrect. Please enter the format as xx:xx:xx:xx:xx:xx");
+             return ESP_ERR_INVALID_ARG;
+         }
++
++        /**< esp_wifi ignores sta.bssid entirely unless bssid_set is true.
++             Without this the BSSID argument is silently discarded and the
++             STA is free to associate with any node advertising the SSID,
++             which on a mesh means the CSI reference path can change
++             underneath a calibration. */
++        wifi_config.sta.bssid_set = true;
++        ESP_LOGI(TAG, "Pinning to BSSID " MACSTR, MAC2STR(wifi_config.sta.bssid));
+     }
+ 
+     if (strlen((char *)wifi_config.sta.ssid)) {
+@@ -541,6 +549,13 @@ static esp_err_t wifi_scan_func(int argc, char **argv)
+     for (int i = 0; i < ap_number; i++) {
+         memset(&ap_record, 0, sizeof(wifi_ap_record_t));
+ 
++        /**< Upstream zeroed the record and then printed it without ever
++             fetching one, so every row came out as empty ssid / 00:00:.. /
++             channel 0 / rssi 0. Pull the next record off the scan list. */
++        if (esp_wifi_scan_get_ap_record(&ap_record) != ESP_OK) {
++            break;
++        }
++
+         if (ap_record.rssi < filter_rssi) {
+             continue;
+         }
+diff --git a/examples/esp-radar/console_test/main/app_main.c b/examples/esp-radar/console_test/main/app_main.c
+index e97733e..5d7134e 100644
+--- a/examples/esp-radar/console_test/main/app_main.c
++++ b/examples/esp-radar/console_test/main/app_main.c
+@@ -32,11 +32,54 @@
+ #include "hal/uart_ll.h"
+ #include "mbedtls/base64.h"
+ 
++#include "driver/gpio.h"
+ #include "led_strip.h"
+ #include "esp_radar.h"
++#include "esp_csi_gain_ctrl.h"
+ #include "csi_commands.h"
+ 
+ extern esp_ping_handle_t g_ping_handle;
++
++/**
++ * @brief Board LED abstraction.
++ *
++ * Upstream assumes an addressable WS2812, which is right for the Espressif
++ * DevKits but wrong for the Seeed XIAO ESP32S3: that board has a single plain
++ * user LED on GPIO21, wired active low, and does not break out GPIO38 at all.
++ * Driving RMT on GPIO38 there is harmless but gives no feedback whatsoever.
++ *
++ * Set BOARD_XIAO_ESP32S3 to 0 to get the stock WS2812 behaviour back.
++ */
++#define BOARD_XIAO_ESP32S3 1
++
++#if BOARD_XIAO_ESP32S3
++
++#define XIAO_USER_LED_GPIO 21
++
++/**< Colour is collapsed to on/off: any non-black value lights the LED. */
++static inline void board_led_set(uint8_t r, uint8_t g, uint8_t b)
++{
++    gpio_set_level(XIAO_USER_LED_GPIO, (r || g || b) ? 0 : 1);   /**< active low */
++}
++
++static inline void board_led_refresh(void) { }
++
++static esp_err_t board_led_init(void)
++{
++    gpio_config_t led_cfg = {
++        .pin_bit_mask = 1ULL << XIAO_USER_LED_GPIO,
++        .mode         = GPIO_MODE_OUTPUT,
++        .pull_up_en   = GPIO_PULLUP_DISABLE,
++        .pull_down_en = GPIO_PULLDOWN_DISABLE,
++        .intr_type    = GPIO_INTR_DISABLE,
++    };
++    ESP_ERROR_CHECK(gpio_config(&led_cfg));
++    board_led_set(0, 0, 0);
++    return ESP_OK;
++}
++
++#else /* stock WS2812 boards */
++
+ static led_strip_handle_t led_strip;
+ #if CONFIG_IDF_TARGET_ESP32C5
+ #define WS2812_GPIO 27
+@@ -50,6 +93,25 @@ static led_strip_handle_t led_strip;
+ #define WS2812_GPIO 8
+ #else
+ #define WS2812_GPIO 4
++#endif
++
++static inline void board_led_set(uint8_t r, uint8_t g, uint8_t b)
++{
++    led_strip_set_pixel(led_strip, 0, r, g, b);
++}
++
++static inline void board_led_refresh(void)
++{
++    led_strip_refresh(led_strip);
++}
++
++esp_err_t ws2812_led_init(void);
++
++static inline esp_err_t board_led_init(void)
++{
++    return ws2812_led_init();
++}
++
+ #endif
+ #define RECV_ESPNOW_CSI
+ #define CONFIG_LESS_INTERFERENCE_CHANNEL    11
+@@ -295,6 +357,81 @@ static int wifi_cmd_radar(int argc, char **argv)
+     return ESP_OK;
+ }
+ 
++/**
++ * @brief Manual control of the receiver gain used for CSI.
++ *
++ * Measured on this board: agc_gain took 18 distinct values over a session
++ * while RSSI held steady at -46 dBm, and mean CSI frame amplitude tracked
++ * it inversely (agc 40 -> 11.0, agc 45 -> 5.9). That ~2x swing is a
++ * receiver artefact, not the room, and it lands directly in
++ * waveform_wander, which is what makes presence-while-motionless drift.
++ * Pinning the gain removes the noise source instead of compensating it.
++ */
++static struct {
++    struct arg_int *force_agc;
++    struct arg_int *force_fft;
++    struct arg_lit *automatic;
++    struct arg_lit *status;
++    struct arg_end *end;
++} gain_args;
++
++static int cmd_csi_gain(int argc, char **argv)
++{
++    if (arg_parse(argc, argv, (void **) &gain_args) != ESP_OK) {
++        arg_print_errors(stderr, gain_args.end, argv[0]);
++        return ESP_FAIL;
++    }
++
++#if WIFI_CSI_PHY_GAIN_ENABLE
++    if (gain_args.automatic->count) {
++        esp_csi_gain_ctrl_reset_rx_gain_baseline();
++        ESP_LOGI(TAG, "GAIN: reset to automatic, baseline cleared");
++    }
++
++    if (gain_args.force_agc->count && gain_args.force_fft->count) {
++        esp_err_t err = esp_csi_gain_ctrl_set_rx_force_gain((uint8_t)gain_args.force_agc->ival[0],
++                                                            (int8_t)gain_args.force_fft->ival[0]);
++        ESP_LOGI(TAG, "GAIN: force agc=%d fft=%d -> %s",
++                 gain_args.force_agc->ival[0], gain_args.force_fft->ival[0], esp_err_to_name(err));
++    } else if (gain_args.force_agc->count || gain_args.force_fft->count) {
++        ESP_LOGW(TAG, "GAIN: --force_agc and --force_fft must be given together");
++    }
++
++    if (gain_args.status->count) {
++        static const char *state_name[] = { "COLLECT", "READY", "FORCE" };
++        uint8_t agc = 0;
++        int8_t fft = 0;
++        rx_gain_status_t st = esp_csi_gain_ctrl_get_gain_status();
++        esp_csi_gain_ctrl_get_rx_gain_baseline(&agc, &fft);
++        ESP_LOGI(TAG, "GAIN: status=%s baseline_agc=%d baseline_fft=%d",
++                 (st <= RX_GAIN_FORCE) ? state_name[st] : "UNKNOWN", agc, fft);
++    }
++#else
++    ESP_LOGW(TAG, "GAIN: rx gain control is not available for this target");
++#endif
++
++    return ESP_OK;
++}
++
++void cmd_register_csi_gain(void)
++{
++    gain_args.force_agc  = arg_int0(NULL, "force_agc", "<0~63>", "Pin the AGC gain to a fixed value");
++    gain_args.force_fft  = arg_int0(NULL, "force_fft", "<-128~127>", "Pin the FFT gain to a fixed value");
++    gain_args.automatic  = arg_lit0(NULL, "automatic", "Return to automatic gain and clear the baseline");
++    gain_args.status     = arg_lit0(NULL, "status", "Print gain status and the learned baseline");
++    gain_args.end        = arg_end(4);
++
++    const esp_console_cmd_t gain_cmd = {
++        .command = "csi_gain",
++        .help = "Receiver gain control for CSI stability",
++        .hint = NULL,
++        .func = &cmd_csi_gain,
++        .argtable = &gain_args
++    };
++
++    ESP_ERROR_CHECK(esp_console_cmd_register(&gain_cmd));
++}
++
+ void cmd_register_radar(void)
+ {
+     radar_args.train_start = arg_lit0(NULL, "train_start", "Start calibrating the 'Radar' algorithm");
+@@ -478,12 +615,12 @@ static void wifi_radar_cb(void *ctx, const wifi_radar_info_t *info)
+         static bool led_status = false;
+ 
+         if (led_status) {
+-            led_strip_set_pixel(led_strip, 0, 0, 0, 0);
++            board_led_set(0, 0, 0);
+         } else {
+-            led_strip_set_pixel(led_strip, 0, 255, 255, 0);
++            board_led_set(255, 255, 0);
+         }
+         led_status = !led_status;
+-        led_strip_refresh(led_strip);
++        board_led_refresh();
+         return;
+     }
+ 
+@@ -494,11 +631,11 @@ static void wifi_radar_cb(void *ctx, const wifi_radar_info_t *info)
+ 
+     if (room_status) {
+         if (human_status) {
+-            led_strip_set_pixel(led_strip, 0, 0, 255, 0);
++            board_led_set(0, 255, 0);
+             ESP_LOGI(TAG, "Someone moved");
+             s_last_move_time = esp_log_timestamp();
+         } else if (esp_log_timestamp() - s_last_move_time > 3 * 1000) {
+-            led_strip_set_pixel(led_strip, 0, 255, 255, 255);
++            board_led_set(255, 255, 255);
+             ESP_LOGI(TAG, "Someone");
+         }
+ 
+@@ -506,12 +643,12 @@ static void wifi_radar_cb(void *ctx, const wifi_radar_info_t *info)
+     } else if (esp_log_timestamp() - s_last_someone_time > 3 * 1000) {
+         if (human_status) {
+             s_last_move_time = esp_log_timestamp();
+-            led_strip_set_pixel(led_strip, 0, 255, 0, 0);
++            board_led_set(255, 0, 0);
+         } else if (esp_log_timestamp() - s_last_move_time > 3 * 1000) {
+-            led_strip_set_pixel(led_strip, 0, 0, 0, 0);
++            board_led_set(0, 0, 0);
+         }
+     }
+-    led_strip_refresh(led_strip);
++    board_led_refresh();
+ }
+ 
+ static void trigger_router_send_data_task(void *arg)
+@@ -625,6 +762,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+ 
+     }
+ }
++#if !BOARD_XIAO_ESP32S3
+ esp_err_t ws2812_led_init(void)
+ {
+     led_strip_config_t strip_config = {
+@@ -655,6 +793,7 @@ esp_err_t ws2812_led_init(void)
+     led_strip_clear(led_strip);
+     return ESP_OK;
+ }
++#endif
+ void app_main(void)
+ {
+     ESP_LOGI(TAG, "app_main start, line: %d", __LINE__);
+@@ -672,7 +811,7 @@ void app_main(void)
+     /**
+      * @brief Install ws2812 driver, Used to display the status of the device
+      */
+-    ws2812_led_init();
++    board_led_init();
+ 
+     ESP_LOGI(TAG, "app_main start, line: %d", __LINE__);
+     /**
+@@ -685,9 +824,17 @@ void app_main(void)
+      */
+     esp_console_repl_t *repl = NULL;
+     esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
+-    esp_console_dev_uart_config_t uart_config = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
+     repl_config.prompt = "csi>";
++
++#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
++    /**< Boards with no UART bridge chip (e.g. Seeed XIAO ESP32S3) reach the
++         host only through the built-in USB Serial/JTAG peripheral. */
++    esp_console_dev_usb_serial_jtag_config_t usj_config = ESP_CONSOLE_DEV_USB_SERIAL_JTAG_CONFIG_DEFAULT();
++    ESP_ERROR_CHECK(esp_console_new_repl_usb_serial_jtag(&usj_config, &repl_config, &repl));
++#else
++    esp_console_dev_uart_config_t uart_config = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
+     ESP_ERROR_CHECK(esp_console_new_repl_uart(&uart_config, &repl_config, &repl));
++#endif
+ 
+ #if CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S2
+     /**< Fix serial port garbled code due to high baud rate */
+@@ -725,6 +872,7 @@ void app_main(void)
+     cmd_register_wifi_config();
+     cmd_register_wifi_scan();
+     cmd_register_radar();
++    cmd_register_csi_gain();
+     ESP_ERROR_CHECK(esp_console_start_repl(repl));
+ 
+     /**

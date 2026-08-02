@@ -1,0 +1,50 @@
+# Copy to config.toml and fill in. config.toml is gitignored - it holds secrets.
+
+[serial]
+port = "auto"   # or a fixed path like "/dev/cu.usbmodem1101"
+baud = 115200
+
+[wifi]
+# Reapplied after every board reset; console_test keeps none of this in NVS.
+wifi_ssid     = "YOUR_SSID"
+wifi_password = "CHANGE_ME"
+# Pin the BSSID. On a mesh the STA will otherwise roam between nodes and the
+# CSI reference path changes underneath the calibration.
+wifi_bssid    = "aa:bb:cc:dd:ee:ff"   # from: wifi_scan -s YOUR_SSID
+
+[gain]
+# Pin the receiver gain. Without this, AGC swings CSI amplitude ~2x on its own
+# and presence-while-motionless does not work at all.
+# Read the right values from the board first:
+#     csi_gain --status      (wait ~25s for status=READY)
+# These are per-AP and per-position - re-read them if you move the board.
+force_agc = 51
+force_fft = -44
+
+[thresholds]
+# Leave unset to use whatever calibration produces.
+# Only the ratio threshold/sensitivity matters; defaults are
+# someone_sensitivity=0.15, move_sensitivity=0.20.
+# someone_threshold = 0.021
+# move_threshold    = 0.005
+calibrate_seconds = 90
+
+[mqtt]
+mqtt_host     = "192.168.68.10"
+mqtt_port     = 1883
+mqtt_username = ""
+mqtt_password = ""
+base_topic       = "csi_radar"
+discovery_prefix = "homeassistant"
+
+[device]
+device_id   = "xiao_csi_radar"
+device_name = "CSI Presence Radar"
+
+[behaviour]
+publish_interval = 1.0
+# Occupancy stays ON this long after the last positive sample. The board's
+# update rate drops when the room is occupied, so a generous hold avoids
+# flapping. Motion also counts as occupancy.
+occupancy_hold = 60.0
+motion_hold    = 5.0
