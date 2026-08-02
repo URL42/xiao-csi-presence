@@ -82,10 +82,10 @@ class Config:
     mqtt_port: int = 1883
     mqtt_username: str = ""
     mqtt_password: str = ""
-    base_topic: str = "csi_radar"
+    base_topic: str = "sensors"
     discovery_prefix: str = "homeassistant"
 
-    device_id: str = "xiao_csi_radar"
+    device_id: str = "csi_radar"
     device_name: str = "CSI Presence Radar"
 
     publish_interval: float = 1.0

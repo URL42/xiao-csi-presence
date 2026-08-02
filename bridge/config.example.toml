@@ -40,11 +40,13 @@ mqtt_host     = "YOUR_BROKER_HOST"
 mqtt_port     = 1883
 mqtt_username = ""
 mqtt_password = ""
-base_topic       = "csi_radar"
+# Topics become sensors/<device_id>/<metric>, matching the
+# sensors/aircube/<metric> convention used by mqtt-mcp.
+base_topic       = "sensors"
 discovery_prefix = "homeassistant"
 
 [device]
-device_id   = "xiao_csi_radar"
+device_id   = "csi_radar"
 device_name = "CSI Presence Radar"
 
 [behaviour]
