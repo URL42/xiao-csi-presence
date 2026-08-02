@@ -107,28 +107,39 @@ class Config:
         cfg.validate()
         return cfg
 
-    # Values carried over unedited from config.example.toml. Catching these is
-    # worth a dedicated check: a placeholder BSSID looks entirely plausible in a
-    # log line, and the board fails silently by simply never associating.
+    # Values carried over unedited from config.example.toml, each with advice
+    # specific to that field. A placeholder BSSID in particular looks entirely
+    # plausible in a log line while the board silently never associates.
     PLACEHOLDERS = {
-        "wifi_ssid": {"YOUR_SSID"},
-        "wifi_password": {"CHANGE_ME"},
-        "wifi_bssid": {"aa:bb:cc:dd:ee:ff", "xx:xx:xx:xx:xx:xx"},
-        "mqtt_host": {"YOUR_BROKER_HOST"},
+        "wifi_ssid": (
+            {"YOUR_SSID"},
+            "Set this to your network name.",
+        ),
+        "wifi_password": (
+            {"CHANGE_ME"},
+            "Set this to your network password.",
+        ),
+        "wifi_bssid": (
+            {"aa:bb:cc:dd:ee:ff", "xx:xx:xx:xx:xx:xx"},
+            "Get the real BSSID from the board's console:\n"
+            "        wifi_scan -s <your ssid>",
+        ),
+        "mqtt_host": (
+            {"YOUR_BROKER_HOST"},
+            "Set this to your MQTT broker's hostname or IP (for Home Assistant\n"
+            "    this is usually the machine running Mosquitto).",
+        ),
     }
 
     def validate(self) -> None:
-        bad = [f"{field} = {getattr(self, field)!r}"
-               for field, dummies in self.PLACEHOLDERS.items()
-               if getattr(self, field) in dummies]
-        if bad:
+        problems = []
+        for field, (dummies, hint) in self.PLACEHOLDERS.items():
+            if getattr(self, field) in dummies:
+                problems.append(f"  {field} = {getattr(self, field)!r}\n    {hint}")
+        if problems:
             raise SystemExit(
                 "config.toml still contains placeholder values from the "
-                "example file:\n  " + "\n  ".join(bad) +
-                "\n\nGet the real BSSID from the board's console:\n"
-                "    wifi_scan -s <your ssid>\n"
-                "and the gain baseline from:\n"
-                "    csi_gain --status"
+                "example file:\n\n" + "\n\n".join(problems) + "\n"
             )
         if self.wifi_bssid and not re.fullmatch(
                 r"([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}", self.wifi_bssid):
